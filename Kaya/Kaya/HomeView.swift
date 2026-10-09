@@ -59,6 +59,12 @@ struct HomeView: View {
     @State private var pendingFact: String?
     /// Facts the user declined this session — never re-asked.
     @State private var declinedFacts = Set<String>()
+    /// Set when the user taps the orb while Kaya is still speaking — the
+    /// mic comes up as soon as she finishes instead of the tap being lost.
+    @State private var micRequestedAfterSpeech = false
+    /// Bumped every time the chat closes — a deferred action from
+    /// `respondThen` only fires while its conversation is still open.
+    @State private var conversationEpoch = 0
 
     /// Which scheduling question Kaya is waiting on, if any.
     private enum PendingQuestion {
@@ -468,6 +474,7 @@ struct HomeView: View {
     /// Closes the chat — used by the pull-down grabber, the "bye" voice
     /// command path, and any code that wants the conversation gone.
     private func closeConversation() {
+        conversationEpoch += 1
         finishVoiceSession(route: false)
         speech.stop()
         showConversation = false
@@ -476,6 +483,7 @@ struct HomeView: View {
         pendingGoal = ""
         pendingQuestion = .none
         pendingFact = nil
+        micRequestedAfterSpeech = false
     }
 
     /// Pull-to-dismiss — dragging the grabber (or the gap above the
@@ -794,8 +802,16 @@ struct HomeView: View {
         // Tapping while Kaya is mid-reply cuts her off — the mic wins.
         speech.stop()
         // Mid-conversation tap: resume listening without wiping the chat.
+        // Must still go through enable() — a bare startListening() no-ops
+        // silently when permission was never granted (dead orb tap).
         if showConversation {
-            voice.startListening()
+            Task {
+                guard await voice.enable() else {
+                    appendKaya("I can't hear you right now — check the microphone in Settings, or tap a suggestion below.")
+                    return
+                }
+                voice.startListening()
+            }
             return
         }
         heardText = ""
@@ -817,8 +833,12 @@ struct HomeView: View {
                 scheduleAutoRoute()
             }
             // If the opener is still being read aloud, let it finish — the
-            // speak callback's keepListening brings the mic up after.
-            if !speech.isSpeaking { voice.startListening() }
+            // speak callback's keepListening honors the pending request.
+            if !speech.isSpeaking {
+                voice.startListening()
+            } else {
+                micRequestedAfterSpeech = true
+            }
         }
     }
 
@@ -848,15 +868,13 @@ struct HomeView: View {
     /// Listening stops for real once we leave this screen.
     private func respondThen(_ message: String, _ action: @escaping () -> Void) {
         appendKaya(message, speak: false)
+        // If the chat closes (grab, "bye", a new session) before the delay
+        // ends, the action must not fire — closing means "don't do that".
+        let epoch = conversationEpoch
         let finish = {
-            autoRouteTask?.cancel()
-            voice.stopListening()
-            speech.stop()
+            guard epoch == conversationEpoch, showConversation else { return }
+            closeConversation()
             action()
-            showConversation = false
-            conversation = []
-            pendingQuestion = .none
-            pendingFact = nil
         }
         guard speakReplies else {
             Task {
@@ -889,7 +907,8 @@ struct HomeView: View {
             guard showConversation, !isGenerating,
                   voice.isAuthorized, !voice.isUnsupported,
                   !voice.isListening, !speech.isSpeaking,
-                  pendingQuestion != .none else { return }
+                  pendingQuestion != .none || micRequestedAfterSpeech else { return }
+            micRequestedAfterSpeech = false
             voice.startListening()
         }
     }
@@ -1153,8 +1172,11 @@ struct HomeView: View {
     /// Yes/no answers while a remember-offer is pending. Returns true when
     /// the utterance was consumed — anything else falls through to normal
     /// routing and the offer stays visible as chips.
+    /// A digit in the reply means it isn't a clean yes/no ("ok 8 am" is
+    /// answering something else) — let it fall through rather than
+    /// swallowing the rest of what they said.
     private func handleFactReply(_ t: String) -> Bool {
-        guard pendingFact != nil else { return false }
+        guard pendingFact != nil, !t.contains(where: \.isNumber) else { return false }
         let yes = ["yes", "yeah", "yep", "sure", "remember", "okay", "ok",
                    "oo", "opo", "sige", "tandaan", "pwede"]
         let no = ["no", "nope", "nah", "don't", "no thanks", "not now",
@@ -1164,6 +1186,9 @@ struct HomeView: View {
             pendingFact = nil
             pendingQuestion = .none
             profile.learnedFacts.append(fact)
+            // Invalidate first — if the redistill fails, the fallback
+            // context (raw facts) stays correct instead of going stale.
+            profile.aiContextSummary = ""
             try? modelContext.save()
             appendKaya("I'll remember that.")
             keepListening()
@@ -1706,7 +1731,8 @@ struct HomeView: View {
                 appendKaya(last.text)
             }
             keepListening()
-        case t.contains("start") || t == "yes" || t == "sure" || t == "go"
+        // "restart" contains "start" — it means remake the plan, not begin it.
+        case (t.contains("start") && !t.contains("restart")) || t == "yes" || t == "sure" || t == "go"
             || t.contains("begin") || t.contains("sounds good") || t.contains("looks good")
             || t.contains("let's do it") || t.contains("lets do it") || t.contains("i'm ready")
             || t == "sige" || t == "sige na" || t == "oo" || t == "opo" || t == "yes"
@@ -1728,7 +1754,8 @@ struct HomeView: View {
             appendKaya("Here are the steps:\n\(list)")
             keepListening()
         case t.contains("again") || t.contains("different") || t.contains("redo")
-            || t.contains("try again") || t.contains("not quite") || t.contains("another version")
+            || t.contains("restart") || t.contains("try again") || t.contains("not quite")
+            || t.contains("another version")
             || t.contains("make another") || t.contains("something else")
             || t == "ulit" || t == "iba" || t.contains("iba naman") || t.contains("ibang")
             || t.contains("hindi ganito") || t.contains("gusto ko iba"):
@@ -1925,21 +1952,32 @@ struct HomeView: View {
     }
 
     /// Finds a time of day in a reply: "8 am", "17:30", "in the morning".
+    /// Bare digits count ("at 8") — but a number measuring a duration is
+    /// not a clock time, so "in 2 days" must not match 2:00.
     private func minutesNamed(in t: String) -> Int? {
         if t.contains("morning") { return 8 * 60 }
         if t.contains("noon") || t.contains("midday") { return 12 * 60 }
         if t.contains("afternoon") { return 14 * 60 }
         if t.contains("evening") { return 18 * 60 }
         if t.contains("night") { return 20 * 60 }
-        guard let match = t.firstMatch(of: #/(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/#),
-              let hourRaw = Int(match.1) else { return nil }
-        var hour = hourRaw
-        let minute = match.2.flatMap { Int($0) } ?? 0
-        let meridiem = (match.3.map(String.init) ?? "").lowercased()
-        if meridiem.hasPrefix("p"), hour < 12 { hour += 12 }
-        if meridiem.hasPrefix("a"), hour == 12 { hour = 0 }
-        guard (0..<24).contains(hour), (0..<60).contains(minute) else { return nil }
-        return hour * 60 + minute
+        let durationUnit = #/^(days?|weeks?|hours?|hrs?|minutes?|mins?|months?|times|araw|linggo|oras|minuto|beses)\b/#
+        for match in t.matches(of: #/(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/#) {
+            guard let hourRaw = Int(match.1) else { continue }
+            // Skip duration counts: "2 days", "every 3 weeks", "12 hours".
+            if match.3 == nil,
+               t[match.range.upperBound...].drop(while: \.isWhitespace)
+                   .lowercased().firstMatch(of: durationUnit) != nil {
+                continue
+            }
+            var hour = hourRaw
+            let minute = match.2.flatMap { Int($0) } ?? 0
+            let meridiem = (match.3.map(String.init) ?? "").lowercased()
+            if meridiem.hasPrefix("p"), hour < 12 { hour += 12 }
+            if meridiem.hasPrefix("a"), hour == 12 { hour = 0 }
+            guard (0..<24).contains(hour), (0..<60).contains(minute) else { continue }
+            return hour * 60 + minute
+        }
+        return nil
     }
 
     /// True when the spoken text contains the title, the title contains it,

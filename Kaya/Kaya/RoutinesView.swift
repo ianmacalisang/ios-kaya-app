@@ -81,16 +81,24 @@ struct RoutinesView: View {
             .fullScreenCover(item: $activeRoutine) { routine in
                 GuidedTaskView(routine: routine)
             }
-            // A reminder's "Start now" lands here via AppNavigation.
-            .onChange(of: AppNavigation.shared.routineRequestID) { _, id in
-                guard let id else { return }
-                AppNavigation.shared.routineRequestID = nil
-                if let routine = routines.first(where: { $0.uuid == id }) {
-                    if routine.isFinished { RoutineStore.restart(routine, in: modelContext) }
-                    activeRoutine = routine
-                }
-            }
+            // A reminder's "Start now" lands here via AppNavigation. TabView
+            // children are lazy, so a request can arrive before this view
+            // exists — check on appear too, not just on change.
+            .onAppear { openRequestedRoutine() }
+            .onChange(of: AppNavigation.shared.routineRequestID) { _, _ in openRequestedRoutine() }
+            .onChange(of: routines.count) { _, _ in openRequestedRoutine() }
         }
+    }
+
+    /// Opens the routine a notification asked for. Only consumes the
+    /// request once the routine is actually found — on this tab's first
+    /// appearance the @Query may not have loaded yet.
+    private func openRequestedRoutine() {
+        guard let id = AppNavigation.shared.routineRequestID else { return }
+        guard let routine = routines.first(where: { $0.uuid == id }) else { return }
+        AppNavigation.shared.routineRequestID = nil
+        if routine.isFinished { RoutineStore.restart(routine, in: modelContext) }
+        activeRoutine = routine
     }
 
     // MARK: - Sections

@@ -73,7 +73,12 @@ final class VoiceService: NSObject {
     private(set) var isListening = false
     private(set) var isAuthorized = false
     private(set) var permissionDenied = false
+    /// UI-facing "voice won't work" flag — either a permanent recognizer
+    /// limitation or no usable mic *right now*. The mic half is re-probed
+    /// on every deliberate tap, so plugging in a headset mid-session works.
     private(set) var isUnsupported = false
+    /// No on-device recognizer at all — this can't change at runtime.
+    private var recognizerUnavailable = false
 
     /// Everything heard since `markHandled()` was last called.
     private(set) var transcript = ""
@@ -95,14 +100,31 @@ final class VoiceService: NSObject {
 
     /// Philippine English first — it transcribes Taglish and Filipino-
     /// accented English more faithfully than en-US, and plain English still
-    /// works. (Verified on-device: no fil/tl recognizer exists in the SDK.)
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-PH"))
-        ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    /// works. But Kaya never sends audio off-device, so the recognizer must
+    /// support on-device mode: en-PH exists on real hardware but is often
+    /// network-only, which would make every orb tap dead. Fall back to
+    /// en-US, which always has an on-device model.
+    private let recognizer: SFSpeechRecognizer? = {
+        for code in ["en-PH", "en-US"] {
+            if let candidate = SFSpeechRecognizer(locale: Locale(identifier: code)) {
+                NSLog("Kaya Voice: %@ recognizer exists, on-device=%d",
+                      code, candidate.supportsOnDeviceRecognition)
+                if candidate.supportsOnDeviceRecognition { return candidate }
+            } else {
+                NSLog("Kaya Voice: %@ recognizer unavailable", code)
+            }
+        }
+        return SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    }()
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var wantsListening = false
     private var consecutiveFailures = 0
+    /// Words heard before a mid-listen session restart — the recognizer
+    /// ends itself after ~60s, and without this carry-over everything
+    /// said before the boundary would vanish.
+    private var transcriptPrefix = ""
 
     /// Seconds of silence before the mic turns itself off. 0 means stay on
     /// (the default — the task player waits patiently through long steps).
@@ -113,19 +135,27 @@ final class VoiceService: NSObject {
 
     override init() {
         super.init()
-        if recognizer?.supportsOnDeviceRecognition == false {
-            isUnsupported = true
+        // nil recognizer counts too — `nil == false` would slip past a
+        // plain supportsOnDeviceRecognition check and fail silently.
+        recognizerUnavailable = recognizer == nil
+            || recognizer?.supportsOnDeviceRecognition == false
+        isUnsupported = recognizerUnavailable
+        if recognizerUnavailable {
+            NSLog("Kaya Voice: no on-device recognizer — voice disabled")
         }
     }
 
     /// Ask for Speech + Microphone permission once. Returns false if refused.
     @discardableResult
     func enable() async -> Bool {
-        guard !isUnsupported else { return false }
+        // Gate on the permanent check only — a missing mic is re-probed
+        // in startListening each time the user asks.
+        guard !recognizerUnavailable else { return false }
         if isAuthorized { return true }
 
         let speechGranted = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
+                NSLog("Kaya Voice: speech authorization -> %d", status.rawValue)
                 continuation.resume(returning: status == .authorized)
             }
         }
@@ -134,6 +164,7 @@ final class VoiceService: NSObject {
             return false
         }
         let micGranted = await AVAudioApplication.requestRecordPermission()
+        NSLog("Kaya Voice: mic permission -> %d", micGranted)
 
         isAuthorized = micGranted
         permissionDenied = !isAuthorized
@@ -141,34 +172,80 @@ final class VoiceService: NSObject {
     }
 
     func startListening() {
+        // A deliberate start re-probes the input — a mic plugged in after
+        // launch must not stay dead just because earlier probes failed.
+        let freshRequest = !wantsListening
         wantsListening = true
-        guard let recognizer, isAuthorized, !isUnsupported, !isListening else { return }
+        if freshRequest { consecutiveFailures = 0 }
+        guard let recognizer, isAuthorized, !recognizerUnavailable, !isListening else { return }
 
         teardownRecognition()
 
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .measurement,
-                                 options: [.defaultToSpeaker, .duckOthers])
-        try? session.setActive(true, options: .notifyOthersOnDeactivation)
+        do {
+            try session.setCategory(.playAndRecord, mode: .measurement,
+                                    options: [.defaultToSpeaker, .duckOthers])
+        } catch {
+            NSLog("Kaya Voice: setCategory failed — %@", error.localizedDescription)
+        }
+        do {
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            NSLog("Kaya Voice: setActive failed — %@", error.localizedDescription)
+        }
+        audioEngine.prepare()
+
+        // Probe the input only after the record session is active — before
+        // that, the format can validly report 0 Hz on a cold start.
+        // No usable input = an invalid format (e.g. a simulator on a Mac
+        // with no microphone). installTap raises an ObjC exception there,
+        // which Swift can't catch — so check first and treat it as a
+        // normal retryable failure; only if retries keep failing is voice
+        // marked unavailable.
+        let inputNode = audioEngine.inputNode
+        var format = inputNode.outputFormat(forBus: 0)
+        if format.sampleRate <= 0 {
+            // The node may not have propagated the hardware format yet —
+            // the input side reports what the hardware actually offers.
+            format = inputNode.inputFormat(forBus: 0)
+        }
+        NSLog("Kaya Voice: probe rate=%.0f ch=%d, inputAvailable=%d, inputs=%d, route=%@",
+              format.sampleRate, format.channelCount,
+              session.isInputAvailable, session.inputNumberOfChannels,
+              session.currentRoute.inputs.map { $0.portName }.joined(separator: ","))
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            consecutiveFailures += 1
+            if consecutiveFailures >= 3 { isUnsupported = true }
+            restartIfWanted()
+            return
+        }
 
         let newRequest = SFSpeechAudioBufferRecognitionRequest()
         newRequest.requiresOnDeviceRecognition = true
         newRequest.shouldReportPartialResults = true
         request = newRequest
-        transcript = ""
+        transcript = transcriptPrefix
         detectedLanguage = "en"
-        handledLength = 0
+        // handledLength survives restarts: it indexes into the preserved
+        // prefix, so `unhandled` still means "not yet reacted to".
+        if transcript.isEmpty { handledLength = 0 }
 
         recognitionTask = recognizer.recognitionTask(with: newRequest) { [weak self] result, error in
             Task { @MainActor in
                 guard let self else { return }
                 if let result {
-                    self.transcript = result.bestTranscription.formattedString
+                    // This session's words append to whatever was heard
+                    // before a mid-listen restart.
+                    let heard = result.bestTranscription.formattedString
+                    self.transcript = self.transcriptPrefix.isEmpty
+                        ? heard
+                        : self.transcriptPrefix + " " + heard
                     self.detectedLanguage = Tagalog.isTagalog(self.transcript) ? "fil" : "en"
                     self.lastHeardAt = Date()
                     self.onTranscript?()
                 }
-                if error != nil {
+                if let error {
+                    NSLog("Kaya Voice: recognition error — %@", error.localizedDescription)
                     self.consecutiveFailures += 1
                 }
                 if error != nil || (result?.isFinal ?? false) {
@@ -178,8 +255,6 @@ final class VoiceService: NSObject {
             }
         }
 
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
         let capturedRequest = newRequest
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             capturedRequest.append(buffer)
@@ -189,9 +264,11 @@ final class VoiceService: NSObject {
             try audioEngine.start()
             isListening = true
             consecutiveFailures = 0
+            isUnsupported = recognizerUnavailable
             lastHeardAt = Date()
             armIdleWatchdog()
         } catch {
+            NSLog("Kaya Voice: engine start failed — %@", error.localizedDescription)
             consecutiveFailures += 1
             teardownRecognition()
             restartIfWanted()
@@ -202,6 +279,10 @@ final class VoiceService: NSObject {
         wantsListening = false
         consecutiveFailures = 0
         teardownRecognition()
+        // A deliberate stop ends the utterance epoch — the next session
+        // starts clean rather than resurrecting old words.
+        transcriptPrefix = ""
+        handledLength = 0
     }
 
     /// Mark everything heard so far as consumed, so it isn't re-parsed.
@@ -214,9 +295,14 @@ final class VoiceService: NSObject {
             wantsListening = false
             return
         }
+        // Freeze what was heard — the next session prepends it so a
+        // mid-sentence restart (the ~60s recognizer limit, an error)
+        // doesn't drop the earlier words.
+        let carry = transcript
         Task {
             try? await Task.sleep(for: .milliseconds(350))
             if wantsListening, !isListening {
+                transcriptPrefix = carry
                 startListening()
             }
         }

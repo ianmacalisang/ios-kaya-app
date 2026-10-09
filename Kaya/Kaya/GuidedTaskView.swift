@@ -223,7 +223,9 @@ struct GuidedTaskView: View {
                     if profile.finishDates.count > 200 {
                         profile.finishDates.removeFirst(profile.finishDates.count - 200)
                     }
-                    newMilestones = Momentum.checkNew(in: profile)
+                    // += not =: the final step may have just earned its own
+                    // milestone (appended above) — don't wipe it.
+                    newMilestones += Momentum.checkNew(in: profile)
                     try? modelContext.save()
                 }
                 if shouldSpeak {
@@ -752,6 +754,11 @@ struct GuidedTaskView: View {
 
                 Button {
                     announcedFinish = false
+                    // A fresh run earns a fresh journal offer — these are
+                    // per-finish, not per-view.
+                    journalAsked = false
+                    awaitingJournal = false
+                    journalTask?.cancel()
                     RoutineStore.restart(routine, in: modelContext)
                     narrateCurrent()
                 } label: {

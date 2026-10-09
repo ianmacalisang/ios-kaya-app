@@ -88,7 +88,16 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showOnboarding) {
             OnboardingView()
         }
-        .task { ReminderService.shared.syncAll(routines) }
+        // Reopen finished repeating routines when a new occurrence day
+        // arrives, then rebuild reminders. Repeat on routine-count changes —
+        // the query may still be empty the first time .task runs.
+        .task {
+            RoutineStore.refreshRepeating(routines, in: modelContext)
+            ReminderService.shared.syncAll(routines)
+        }
+        .onChange(of: routines.count) { _, _ in
+            ReminderService.shared.syncAll(routines)
+        }
         // Leaving the app mid-routine arms a gentle "step N is waiting"
         // nudge; coming back cancels it — the routine is already on screen.
         .onChange(of: scenePhase) { _, phase in
@@ -96,6 +105,7 @@ struct ContentView: View {
             case .background:
                 ReminderService.shared.syncInProgress(routines)
             case .active:
+                RoutineStore.refreshRepeating(routines, in: modelContext)
                 ReminderService.shared.cancelInProgressNudges()
             default:
                 break

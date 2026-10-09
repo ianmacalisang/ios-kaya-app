@@ -90,11 +90,17 @@ enum RoutineStore {
             routine.steps.append(record)
         }
         try? context.save()
-        ReminderService.shared.sync(routine)
         // First routine saved with a clock time — one-time iOS opt-in.
+        // Ask first, then sync: sync() skips while authorization is still
+        // notDetermined, so syncing before the grant loses this reminder.
         if routine.isScheduled, routine.scheduledMinutes != nil,
            ReminderService.shared.authorization == .notDetermined {
-            Task { await ReminderService.shared.requestPermission() }
+            Task {
+                await ReminderService.shared.requestPermission()
+                ReminderService.shared.sync(routine)
+            }
+        } else {
+            ReminderService.shared.sync(routine)
         }
         return routine
     }
@@ -113,6 +119,22 @@ enum RoutineStore {
         try? context.save()
         // Re-arm the reminder — the routine is back on the calendar.
         ReminderService.shared.sync(routine)
+    }
+
+    /// A finished repeat routine isn't finished forever — "every day"
+    /// means it comes back tomorrow. When a new occurrence day arrives
+    /// after the finish day, reopen the routine so it's due again.
+    /// Completion history (reflections, photos, finishDates) stays put.
+    static func refreshRepeating(_ routines: [Routine], in context: ModelContext) {
+        let today = Date()
+        for routine in routines where routine.isFinished && routine.repeatRule != .none {
+            guard routine.occurs(on: today) else { continue }
+            if let finishedAt = routine.finishedAt,
+               Calendar.current.isDate(finishedAt, inSameDayAs: today) {
+                continue
+            }
+            restart(routine, in: context)
+        }
     }
 
     static func touch(_ routine: Routine, in context: ModelContext) {

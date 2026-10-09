@@ -112,8 +112,12 @@ final class ReminderService {
     /// Re-arm "you're partway through" nudges for routines left mid-run —
     /// called when the app backgrounds, since banners also show in the
     /// foreground and would otherwise interrupt the routine itself.
+    /// The async work races suspension, so it runs inside a background
+    /// task — otherwise the nudge silently never gets scheduled.
     func syncInProgress(_ routines: [Routine]) {
         Task { @MainActor in
+            let taskID = UIApplication.shared.beginBackgroundTask()
+            defer { UIApplication.shared.endBackgroundTask(taskID) }
             let pending = await center.pendingNotificationRequests()
             let stale = pending.map(\.identifier).filter { $0.hasPrefix("inprogress-") }
             center.removePendingNotificationRequests(withIdentifiers: stale)
@@ -170,8 +174,12 @@ final class ReminderService {
     #endif
 
     private func schedule(for routine: Routine) {
-        // Finished routines stay quiet — restart re-arms via syncAll/sync.
-        guard routine.isScheduled, !routine.isFinished,
+        // Finished one-offs stay quiet — but a repeating routine keeps its
+        // reminder armed. The daily/weekly trigger must fire on the next
+        // occurrence even if the app is never opened in between; opening it
+        // (or tapping the reminder) reopens the routine for that day.
+        guard routine.isScheduled,
+              !(routine.isFinished && routine.repeatRule == .none),
               let trigger = trigger(for: routine) else { return }
 
         let content = UNMutableNotificationContent()

@@ -13,6 +13,7 @@ struct AboutYouView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @Query private var profiles: [UserProfile]
+    @Query private var routines: [Routine]
 
     @State private var showEdit = false
     @State private var reminders = ReminderService.shared
@@ -66,7 +67,7 @@ struct AboutYouView: View {
                 if phase == .active { reminders.refreshStatus() }
             }
             .onChange(of: remindersEnabled) { _, on in
-                if !on { reminders.clearAll() }
+                if on { reminders.syncAll(routines) } else { reminders.clearAll() }
             }
             .fullScreenCover(isPresented: $showEdit) {
                 OnboardingView(existing: profile)
@@ -118,6 +119,10 @@ struct AboutYouView: View {
                     Spacer()
                     Button {
                         profile.learnedFacts.removeAll { $0 == fact }
+                        // Clear the distilled summary NOW — if redistill
+                        // fails, the deleted fact must not keep leaking
+                        // into prompts through the stale summary.
+                        profile.aiContextSummary = ""
                         try? modelContext.save()
                         Task { await redistill(profile) }
                     } label: {

@@ -69,7 +69,9 @@ struct RoutineReviewView: View {
                     .frame(height: 80)
                     Text(voice.isListening
                          ? "Listening… say “start”, “read steps”, or “back”."
-                         : "Tap the mic, or use the buttons below.")
+                         : (voice.permissionDenied || voice.isUnsupported)
+                            ? "Voice isn't available here — use the buttons below."
+                            : "Tap the mic, or use the buttons below.")
                         .font(.caption)
                         .foregroundStyle(KayaTheme.subtleText)
                 }

@@ -480,6 +480,9 @@ struct OnboardingView: View {
             modelContext.insert(created)
             profile = created
         }
+        // The old summary described the old answers — drop it now so the
+        // fallback context is used until the fresh distill lands.
+        profile.aiContextSummary = ""
         try? modelContext.save()
         distillProfileContext(profile)
         dismiss()
